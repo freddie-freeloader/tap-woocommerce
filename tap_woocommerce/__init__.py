@@ -6,16 +6,14 @@ import time
 import re
 import json
 import attr
-import urllib
-import requests
-import backoff
-from requests.auth import HTTPBasicAuth
 import singer
 import singer.metrics as metrics
 from singer import utils
 import datetime
+from datetime import datetime
 import dateutil
 from dateutil import parser
+from woocommerce import API
 
 
 REQUIRED_CONFIG_KEYS = ["url", "consumer_key", "consumer_secret", "start_date"]
@@ -28,24 +26,13 @@ CONFIG = {
     "start_date":None
 }
 
-ENDPOINTS = {
-    "orders":"wp-json/wc/v2/orders?after={0}&orderby=date&order=asc&per_page=100&page={1}"
-}
-
-def get_endpoint(endpoint, kwargs):
-    '''Get the full url for the endpoint'''
-    if endpoint not in ENDPOINTS:
-        raise ValueError("Invalid endpoint {}".format(endpoint))
-    
-    after = urllib.parse.quote(kwargs[0])
-    page = kwargs[1]
-    return CONFIG["url"]+ENDPOINTS[endpoint].format(after,page)
-
 def get_start(STATE, tap_stream_id, bookmark_key):
     current_bookmark = singer.get_bookmark(STATE, tap_stream_id, bookmark_key)
     if current_bookmark is None:
-        return CONFIG["start_date"]
-    return current_bookmark
+        start_date = CONFIG["start_date"]
+    else:
+        start_date = current_bookmark
+    return datetime.strptime(start_date, '%Y-%m-%d').isoformat()
 
 def load_schema(entity):
     '''Returns the schema for the specified source'''
@@ -113,34 +100,45 @@ def filter_order(order):
     }
     return filtered
 
-def giveup(exc):
-    return exc.response is not None \
-        and 400 <= exc.response.status_code < 500 \
-        and exc.response.status_code != 429
-
-@utils.backoff((backoff.expo,requests.exceptions.RequestException), giveup)
-@utils.ratelimit(20, 1)
-def gen_request(stream_id, url):
-    with metrics.http_request_timer(stream_id) as timer:
-        resp = requests.get(url, auth=HTTPBasicAuth(CONFIG["consumer_key"], CONFIG["consumer_secret"]))
-        timer.tags[metrics.Tag.http_status_code] = resp.status_code
-        resp.raise_for_status()
-        return resp.json()
-
-
 def sync_orders(STATE, catalog):
+
+    woocommerce_api = API(
+        url="https://salufast.com",
+        consumer_key=CONFIG["consumer_key"],
+        consumer_secret=CONFIG["consumer_secret"],
+        version="wc/v3",
+        timeout=60,
+        query_string_auth=True
+    )
+
+    def get_orders_by_page(start_date, page_number):
+        response = woocommerce_api.get("orders",
+                                   params={"per_page": 100,
+                                           "page": page_number,
+                                           "orderby": "date",
+                                           "order": "asc",
+                                           "after": start_date})
+        if response.status_code is not 200:
+            LOGGER.critical("Got non 200 status code")
+            try:
+                LOGGER.critical(response.json())
+            except:
+                pass
+            response.raise_for_status()
+        LOGGER.info("Successful fetch")
+        return response.json()
+
     schema = load_schema("orders")
     singer.write_schema("orders", schema, ["order_id"])
 
-    start = get_start(STATE, "orders", "last_update")
-    LOGGER.info("Only syncing orders updated since " + start)
-    last_update = start
+    start_date = get_start(STATE, "orders", "last_update")
+
+    LOGGER.info("Only syncing orders updated since " + start_date)
+    last_update = start_date
     page_number = 1
     with metrics.record_counter("orders") as counter:
         while True:
-            endpoint = get_endpoint("orders", [start, page_number])
-            LOGGER.info("GET %s", endpoint)
-            orders = gen_request("orders",endpoint)
+            orders = get_orders_by_page(start_date, page_number)
             for order in orders:
                 counter.increment()
                 order = filter_order(order)
